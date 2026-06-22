@@ -1,0 +1,30 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.eggs/
+.venv/
+venv/
+.env
+
+# Jupyter
+.ipynb_checkpoints/
+
+# Build/test
+build/
+dist/
+.pytest_cache/
+.coverage
+
+# PIConGPU/openPMD outputs: keep large data out of git
+*.bp
+*.bp5
+*.bp4
+simOutput/
+openPMD/
+*.h5
+
+# Generated media
+*.gif
+*.png
+*.pdf
