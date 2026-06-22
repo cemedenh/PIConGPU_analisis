@@ -1,0 +1,40 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+.venv/
+venv/
+.env
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.ipynb_checkpoints/
+
+# PIConGPU/openPMD heavy outputs
+*.bp
+*.bp5
+*.h5
+simOutput/
+openPMD/
+
+# Generated figures / movies / intermediate exports
+*.png
+*.jpg
+*.jpeg
+*.gif
+*.mp4
+figures/
+movies/
+exports/
+
+# Logs and scheduler output
+*.log
+*.out
+*.err
+slurm-*.out
+
+# OS/editor
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/

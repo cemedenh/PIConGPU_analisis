@@ -1,30 +1,26 @@
 # Python
 __pycache__/
 *.py[cod]
-*.egg-info/
-.eggs/
-.venv/
-venv/
-.env
+.pytest_cache/
 
 # Jupyter
 .ipynb_checkpoints/
 
-# Build/test
-build/
-dist/
-.pytest_cache/
-.coverage
-
-# PIConGPU/openPMD outputs: keep large data out of git
-*.bp
+# Generated PIConGPU / analysis data
 *.bp5
-*.bp4
-simOutput/
-openPMD/
+*.bp
 *.h5
-
-# Generated media
-*.gif
+*.hdf5
 *.png
+*.jpg
+*.jpeg
+*.gif
+*.mp4
+*.avi
 *.pdf
+
+# Logs and local scratch
+*.log
+*.out
+*.err
+.DS_Store

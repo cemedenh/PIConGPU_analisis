@@ -1,9 +1,9 @@
 # Push this clean project to GitHub
 
-From your PC or from Jupyter terminal, after extracting this zip:
+From the extracted project folder:
 
 ```bash
-cd PIConGPU_analisis_clean_project
+cd PIConGPU_analisis_clean_project_v2
 
 git init
 git branch -M main
@@ -11,31 +11,8 @@ git remote add origin git@github.com:cemedenh/PIConGPU_analisis.git
 
 git add .
 git status
-git commit -m "Rebuild clean analysis project"
+git commit -m "Rebuild clean analysis project with corrected notebooks"
 git push -u origin main --force-with-lease
 ```
 
-Use `--force-with-lease` only if you want this clean folder to replace the current GitHub content.
-
-If you prefer not to overwrite history, do this instead:
-
-```bash
-git checkout -b clean-rebuild
-git push -u origin clean-rebuild
-```
-
-Then merge the branch on GitHub.
-
-## Do not add generated data
-
-Do not commit:
-
-```text
-*.bp5
-*.h5
-*.png
-simOutput/
-openPMD/
-.ipynb_checkpoints/
-__pycache__/
-```
+Before committing, make sure `git status` does not show `.h5`, `.bp5`, images, or checkpoint/cache folders.

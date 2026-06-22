@@ -3,4 +3,3 @@ scipy
 matplotlib
 imageio
 adios2
-h5py

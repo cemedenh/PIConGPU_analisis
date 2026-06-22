@@ -35,13 +35,7 @@ import os
 import tempfile
 
 import numpy as np
-try:
-    import adios2
-except ImportError:  # allow importing/testing package without ADIOS2 installed
-    class _MissingADIOS2:
-        def __getattr__(self, name):
-            raise ImportError("adios2 is required for reading PIConGPU/openPMD .bp5 files. Install adios2 in the analysis environment.")
-    adios2 = _MissingADIOS2()
+import adios2
 import matplotlib.pyplot as plt
 import scipy.constants as sc
 
@@ -174,71 +168,31 @@ class NanoPlasmaRun:
 
     def _read_positions_and_weight(self, filename: str, step: int, species: str):
         """
-        Read particle positions in SI meters plus macro-particle weights.
-
-        PIConGPU/openPMD usually stores particle coordinates as:
-            position/*       fractional position inside the cell
-            positionOffset/* integer cell index
-
-        This method reconstructs absolute SI positions as
-            (positionOffset + position) * cell_size
-
-        It also falls back to older/simple outputs where positionOffset is absent.
-        If the species is empty or missing, returns (None, None, None, None).
+        Returns (x, y, z, w) with position in SI units (m) after applying unitSI.
+        If the species is empty at this step or variables are missing, returns (None, None, None, None).
         """
         if self._num_particles(filename, step, species) == 0:
             return None, None, None, None
-
-        self._load_meta()
-        dx, dy, dz = float(self.Dx_SI), float(self.Dy_SI), float(self.Dz_SI)
 
         try:
             with adios2.Stream(filename, "r") as f:
                 for _ in f.steps():
                     base = f"/data/{step}/particles/{species}"
                     try:
-                        x = np.asarray(f.read(f"{base}/position/x"), dtype=np.float64)
-                        y = np.asarray(f.read(f"{base}/position/y"), dtype=np.float64)
-                        z = np.asarray(f.read(f"{base}/position/z"), dtype=np.float64)
-                        w = np.asarray(f.read(f"{base}/weighting"), dtype=np.float64)
+                        x = f.read(f"{base}/position/x")
+                        y = f.read(f"{base}/position/y")
+                        z = f.read(f"{base}/position/z")
+                        w = f.read(f"{base}/weighting")
                     except Exception:
-                        return None, None, None, None
-
-                    if x.size == 0 or y.size == 0 or z.size == 0:
                         return None, None, None, None
 
                     try:
-                        xo = np.asarray(f.read(f"{base}/positionOffset/x"), dtype=np.int64)
-                        yo = np.asarray(f.read(f"{base}/positionOffset/y"), dtype=np.int64)
-                        zo = np.asarray(f.read(f"{base}/positionOffset/z"), dtype=np.int64)
-
-                        # Standard PIConGPU case: position is fractional inside a cell.
-                        if np.nanmax(np.abs(x)) <= 1.5 and np.nanmax(np.abs(y)) <= 1.5 and np.nanmax(np.abs(z)) <= 1.5:
-                            x = (xo + x) * dx
-                            y = (yo + y) * dy
-                            z = (zo + z) * dz
-                        else:
-                            # Fallback: position was already cell-like but offsets exist.
-                            x = x * dx
-                            y = y * dy
-                            z = z * dz
+                        unit_x = f.read_attribute(f"{base}/position/x/unitSI")
                     except Exception:
-                        # No positionOffset. Try unitSI first; otherwise infer cell units.
-                        try:
-                            unit_x = f.read_attribute(f"{base}/position/x/unitSI")
-                        except Exception:
-                            unit_x = None
-
-                        if unit_x is not None:
-                            x = x * float(unit_x)
-                            y = y * float(unit_x)
-                            z = z * float(unit_x)
-                        elif np.nanmax(np.abs(x)) > 2.0 and np.nanmax(np.abs(x)) < 1e7:
-                            x = x * dx
-                            y = y * dy
-                            z = z * dz
-                        # else: assume already SI
-
+                        unit_x = 1.0
+                    x = x * unit_x
+                    y = y * unit_x
+                    z = z * unit_x
                     return x, y, z, w
         except Exception:
             return None, None, None, None
@@ -482,7 +436,7 @@ class NanoPlasmaRun:
         I0_Wcm2: float = 4e14,
         zoom_ions: bool = True,
         ion_zoom_pad_nm: float = 50.0,
-        ion_charge_density_field: str | None = "He_i_all_density",
+        ion_charge_density_field: str | None = None,
         electron_density_field: str = "He_e_all_density",
         fps: int = 10,
         every: int = 1,
@@ -917,8 +871,8 @@ class NanoPlasmaRun:
     
         return t, H
 
+
     def plot_asymmetry_vs_time(
-    
         self,
         species: str = "He_e",
         axis: str = "x",
@@ -927,31 +881,18 @@ class NanoPlasmaRun:
         t_range_fs: tuple[float, float] | None = None,
         skip_before_fs: float | None = None,
         center_component: bool = True,         # subtract weighted mean to remove tiny drift
-    
-        # --- NEW: laser overlay options ---
-        overlay_laser: bool = False,
-        overlay_what: str = "carrier+envelope",   # "carrier", "envelope", "carrier+envelope"
-        envelope_model: str = "gaussian",         # "gaussian" or "sin2"
-        tau_fwhm_fs: float = 7.0,                 # intensity FWHM (fs)
-        lambda_um: float = 0.8,
-        I0_Wcm2: float = 6e13,                    # only used for correct scaling (we normalize anyway)
-        phase_rad: float = 0.0,                   # phase shift of the carrier (rad)
-        overlay_alpha: float = 0.35,
-        overlay_lw: float = 1.5,
-    ):
+        ):
         """
         Asymmetry vs time:
             A(t) = (N+ - N-) / (N+ + N-)
     
-        NEW:
-        Optional laser overlay (normalized) to compare A(t) with the laser oscillation:
-          - carrier: E(t)/E0
-          - envelope: |E|_env/E0  (amplitude envelope)
-        """
-        import numpy as np
-        import matplotlib.pyplot as plt
-        import scipy.constants as sc
+        Safety features (simple, as requested):
+        - if species has 0 particles in the whole system -> skip
+        - if reading momentum fails (px is None) -> skip
+        - optional time/file selection like energy plots
     
+        This avoids meaningless early-time values when no electrons exist yet.
+        """
         axis = axis.lower()
         if axis not in ("x", "y", "z"):
             raise ValueError("axis must be 'x', 'y', or 'z'")
@@ -980,10 +921,17 @@ class NanoPlasmaRun:
                 if (t_fs < tmin) or (t_fs > tmax):
                     continue
     
-            # skip if total particles = 0
+            # NEW: skip if total particles = 0 (whole system)
+            # (requires _num_particles or _num_particles-like helper)
             if hasattr(self, "_num_particles"):
                 if self._num_particles(fn, step, species) == 0:
                     continue
+            elif hasattr(self, "_num_particles") is False and hasattr(self, "_num_particles_count"):
+                if self._num_particles_count(fn, step, species) == 0:
+                    continue
+            else:
+                # fallback: if your reader already returns None when empty, that's OK
+                pass
     
             px, py, pz, w = self._read_momentum_and_weight(fn, step, species)
             if px is None or w is None:
@@ -1012,63 +960,13 @@ class NanoPlasmaRun:
         order = np.argsort(t)
         t, A = t[order], A[order]
     
-        fig, ax = plt.subplots(figsize=(10, 3.5))
-        ax.plot(t, A, "o-", ms=4, label="Asymmetry A(t)")
-        ax.axhline(0, lw=1)
-        ax.set_xlabel("time (fs) (0 fs = laser peak)")
-        ax.set_ylabel("asymmetry A")
-        ax.set_title(f"Asymmetry vs time ({species}, axis={axis})")
-        ax.grid(True)
-    
-        # ---- NEW: laser overlay on secondary axis ----
-        if overlay_laser:
-            # carrier frequency
-            omega = 2.0 * np.pi * sc.c / (lambda_um * 1e-6)  # rad/s
-    
-            # build a dense time grid spanning the plotted range (smooth carrier)
-            t_dense = np.linspace(float(np.min(t)), float(np.max(t)), 4000)
-            t_dense_s = t_dense * 1e-15
-    
-            # intensity envelope (normalized to 1 at peak)
-            if envelope_model == "gaussian":
-                I_norm = np.exp(-4.0 * np.log(2.0) * (t_dense / tau_fwhm_fs) ** 2)
-            elif envelope_model == "sin2":
-                # sin^2 intensity envelope with same FWHM approx:
-                # define half-duration T such that intensity FWHM ~ tau_fwhm_fs
-                # For I = sin^2(pi t / (2T)) on [-T, T], FWHM occurs at sin^2 = 1/2 -> |t| = T/2
-                # so FWHM ~ T. Use T = tau_fwhm_fs.
-                T = float(tau_fwhm_fs)
-                I_norm = np.zeros_like(t_dense)
-                inside = np.abs(t_dense) <= T
-                I_norm[inside] = np.sin(0.5 * np.pi * (t_dense[inside] / T + 1.0)) ** 2
-            else:
-                raise ValueError("envelope_model must be 'gaussian' or 'sin2'.")
-    
-            # amplitude envelope ~ sqrt(I)
-            Eenv_norm = np.sqrt(I_norm)
-    
-            # carrier (normalized)
-            Ecar_norm = Eenv_norm * np.cos(omega * t_dense_s + float(phase_rad))
-    
-            ax2 = ax.twinx()
-            ax2.set_ylabel("laser (normalized)")
-            # keep the overlay visually light
-            if overlay_what in ("carrier", "carrier+envelope"):
-                ax2.plot(t_dense, Ecar_norm, lw=overlay_lw, alpha=overlay_alpha, label="laser carrier (norm)")
-            if overlay_what in ("envelope", "carrier+envelope"):
-                ax2.plot(t_dense, +Eenv_norm, lw=overlay_lw, alpha=overlay_alpha, label="envelope (norm)")
-                ax2.plot(t_dense, -Eenv_norm, lw=overlay_lw, alpha=overlay_alpha)
-    
-            # nice limits for normalized field
-            ax2.set_ylim(-1.05, 1.05)
-    
-            # combined legend
-            lines, labels = ax.get_legend_handles_labels()
-            lines2, labels2 = ax2.get_legend_handles_labels()
-            ax.legend(lines + lines2, labels + labels2, loc="best", fontsize=8)
-        else:
-            ax.legend(loc="best", fontsize=8)
-    
+        plt.figure(figsize=(10, 3.5))
+        plt.plot(t, A, "o-", ms=4)
+        plt.axhline(0, lw=1)
+        plt.xlabel("time (fs) (0 fs = laser peak)")
+        plt.ylabel("asymmetry A")
+        plt.title(f"Asymmetry vs time ({species}, axis={axis})")
+        plt.grid(True)
         plt.tight_layout()
         plt.show()
         plt.close()
@@ -1377,475 +1275,3 @@ class NanoPlasmaRun:
         plt.close()
     
         return t, T
-        
-    def plot_axial_field_evolution(
-        self,      
-        # selection
-        file_indices=None,                 # "all", list, slice, or None
-        t_range_fs: tuple[float, float] | None = None,
-        every: int = 1,
-    
-        # geometry: lineout position
-        z_index: int | None = None,        # default Nz//2
-        y_nm: float | None = None,         # direct y position (nm)
-        y_target_nm: float = 300.0,        # if y_nm is None -> search around this
-        y_search_halfwidth_nm: float = 50.0,
-        y_pick_mode: str = "auto_peak",    # "auto_peak" or "closest"
-    
-        # crop in x (ABSOLUTE nm in the simulation box)
-        x_range_nm: tuple[float, float] | None = None,
-    
-        # fields in openPMD
-        electron_density_field: str = "He_e_all_density",
-        ion_charge_density_field: str = "He_i_all_density",
-    
-        # normalization
-        charge_norm: str = "ion_global_max",   # "ion_global_max" or "ion_per_time_max"
-        field_norm: str = "E0",                # "E0" (laser peak) or "none"
-        I0_Wcm2: float = 4e14,                 # used if field_norm=="E0"
-    
-        # scaling (colormap normalization)
-        charge_scale: str = "symlog",          # "linear", "log_abs", "symlog"
-        field_scale: str = "linear",           # "linear", "symlog", "log_abs"
-        symlog_linthresh_charge: float = 1e-3,
-        symlog_linthresh_field: float = 1e-2,
-    
-        # plotting options
-        cmap_charge: str = "RdBu_r",
-        cmap_field: str = "RdBu_r",
-        vlim_charge: float | None = None,      # symmetric +/- limit for linear/symlog (normalized units)
-        vlim_field: float | None = None,       # symmetric +/- limit for linear/symlog (normalized units)
-        interpolation: str = "none",           # "none", "nearest", "bilinear", "bicubic", ...
-        show: bool = True,
-        savepath: str | None = None,
-    ):
-        from matplotlib import colors as mcolors
-        self._load_meta()
-    
-        # Select file indices
-        if file_indices is None or file_indices == "all":
-            indices = list(range(len(self.files)))
-        elif isinstance(file_indices, slice):
-            indices = list(range(len(self.files)))[file_indices]
-        else:
-            indices = list(file_indices)
-        indices = indices[:: max(1, int(every))]
-    
-        # z slice
-        z0 = int(self.Nz // 2) if z_index is None else int(z_index)
-        z0 = max(0, min(self.Nz - 1, z0))
-    
-        # x coordinate (nm), cell-centered
-        x_nm = (np.arange(self.Nx) + 0.5) * self.Dx_SI * 1e9
-    
-        # x cropping mask
-        if x_range_nm is not None:
-            xmin_nm, xmax_nm = float(x_range_nm[0]), float(x_range_nm[1])
-            mask_x = (x_nm >= xmin_nm) & (x_nm <= xmax_nm)
-            if not np.any(mask_x):
-                raise ValueError(f"x_range_nm={x_range_nm} selects no cells. "
-                                 f"Domain is roughly [{x_nm.min():.1f}, {x_nm.max():.1f}] nm.")
-        else:
-            mask_x = slice(None)
-    
-        x_nm_used = x_nm[mask_x] if not isinstance(mask_x, slice) else x_nm
-    
-        # helper: y index
-        def y_nm_to_idx(yval_nm: float) -> int:
-            yi = int((float(yval_nm) * 1e-9) / self.Dy_SI)
-            return max(0, min(self.Ny - 1, yi))
-    
-        # choose y index
-        if y_nm is not None:
-            y0 = y_nm_to_idx(y_nm)
-            y0_nm_used = (y0 + 0.5) * self.Dy_SI * 1e9
-        else:
-            y_center = y_nm_to_idx(y_target_nm)
-            dy_idx = int((float(y_search_halfwidth_nm) * 1e-9) / self.Dy_SI)
-            y_min = max(0, y_center - dy_idx)
-            y_max = min(self.Ny - 1, y_center + dy_idx)
-            cand = list(range(y_min, y_max + 1))
-    
-            if y_pick_mode == "closest":
-                y0 = y_center
-            elif y_pick_mode == "auto_peak":
-                # pick y that maximizes total |ion| signal along x for the first usable frame
-                best_y = y_center
-                best_val = -np.inf
-    
-                fn0 = None
-                step0 = None
-                for idx in indices:
-                    fn_try = self.files[idx]
-                    st_try = extract_step_from_filename(fn_try)
-                    with adios2.Stream(fn_try, "r") as f:
-                        for _ in f.steps():
-                            if f"/data/{st_try}/fields/{ion_charge_density_field}" in f.available_variables():
-                                fn0, step0 = fn_try, st_try
-                                break
-                    if fn0 is not None:
-                        break
-    
-                if fn0 is None:
-                    y0 = y_center
-                else:
-                    with adios2.Stream(fn0, "r") as f:
-                        for _ in f.steps():
-                            unit_rho_i = f.read_attribute(f"/data/{step0}/fields/{ion_charge_density_field}/unitSI")
-                            for yy in cand:
-                                rho_i_line = (
-                                    f.read(
-                                        f"/data/{step0}/fields/{ion_charge_density_field}",
-                                        start=[z0, yy, 0],
-                                        count=[1, 1, self.Nx],
-                                    )
-                                    * unit_rho_i
-                                )[0, 0, :]
-                                rho_i_line = rho_i_line[mask_x]
-                                val = float(np.sum(np.abs(rho_i_line)))
-                                if val > best_val:
-                                    best_val = val
-                                    best_y = yy
-                    y0 = best_y
-            else:
-                raise ValueError("y_pick_mode must be 'auto_peak' or 'closest'.")
-    
-            y0_nm_used = (y0 + 0.5) * self.Dy_SI * 1e9
-    
-        # Field normalization E0
-        if field_norm == "E0":
-            E0 = np.sqrt(2.0 * float(I0_Wcm2) * 1e4 / (sc.c * sc.epsilon_0))
-        elif field_norm == "none":
-            E0 = 1.0
-        else:
-            raise ValueError("field_norm must be 'E0' or 'none'.")
-    
-        # gather time series of lineouts
-        t_list = []
-        Ex_rows = []
-        rho_rows = []
-        ion_peak_list = []
-    
-        for idx in indices:
-            fn = self.files[idx]
-            step = extract_step_from_filename(fn)
-            t_fs = self.time_fs_from_step(step)
-    
-            if t_range_fs is not None:
-                tmin, tmax = t_range_fs
-                if (t_fs < tmin) or (t_fs > tmax):
-                    continue
-    
-            with adios2.Stream(fn, "r") as f:
-                for _ in f.steps():
-                    # Ex line
-                    unit_E = f.read_attribute(f"/data/{step}/fields/E/x/unitSI")
-                    Ex_line = (
-                        f.read(
-                            f"/data/{step}/fields/E/x",
-                            start=[z0, y0, 0],
-                            count=[1, 1, self.Nx],
-                        )
-                        * unit_E
-                    )[0, 0, :]
-                    Ex_line = (Ex_line[mask_x]) / (E0 + 1e-300)
-    
-                    # charge density fields line
-                    unit_rho_e = f.read_attribute(f"/data/{step}/fields/{electron_density_field}/unitSI")
-                    rho_e_line = (
-                        f.read(
-                            f"/data/{step}/fields/{electron_density_field}",
-                            start=[z0, y0, 0],
-                            count=[1, 1, self.Nx],
-                        )
-                        * unit_rho_e
-                    )[0, 0, :]
-                    rho_e_line = rho_e_line[mask_x]
-    
-                    if f"/data/{step}/fields/{ion_charge_density_field}" in f.available_variables():
-                        unit_rho_i = f.read_attribute(f"/data/{step}/fields/{ion_charge_density_field}/unitSI")
-                        rho_i_line = (
-                            f.read(
-                                f"/data/{step}/fields/{ion_charge_density_field}",
-                                start=[z0, y0, 0],
-                                count=[1, 1, self.Nx],
-                            )
-                            * unit_rho_i
-                        )[0, 0, :]
-                        rho_i_line = rho_i_line[mask_x]
-                    else:
-                        rho_i_line = np.zeros_like(rho_e_line)
-    
-            rho_net = rho_i_line + rho_e_line  # signed net charge density
-    
-            t_list.append(float(t_fs))
-            Ex_rows.append(Ex_line)
-            rho_rows.append(rho_net)
-            ion_peak_list.append(float(np.max(np.abs(rho_i_line)) + 1e-300))
-    
-        if len(t_list) == 0:
-            print("[plot_peltz_fig5_xt_vertical] No frames matched your selection.")
-            return None
-    
-        # sort by time, build arrays as (Nt, Nx)
-        t = np.array(t_list)
-        order = np.argsort(t)
-        t = t[order]
-        Ex_xt = np.array(Ex_rows, dtype=float)[order, :]     # (Nt, Nx)
-        rho_xt = np.array(rho_rows, dtype=float)[order, :]   # (Nt, Nx)
-        ion_peaks = np.array(ion_peak_list, dtype=float)[order]
-    
-        # normalize charge
-        if charge_norm == "ion_global_max":
-            denom = float(np.nanmax(ion_peaks))
-            rho_xt_n = rho_xt / (denom + 1e-300)
-        elif charge_norm == "ion_per_time_max":
-            rho_xt_n = rho_xt / (ion_peaks[:, None] + 1e-300)
-        else:
-            raise ValueError("charge_norm must be 'ion_global_max' or 'ion_per_time_max'.")
-    
-        # colormap norms
-        def make_norm(scale: str, vlim: float | None, linthresh: float):
-            if scale == "linear":
-                return None if vlim is None else mcolors.Normalize(vmin=-vlim, vmax=+vlim)
-            if scale == "symlog":
-                return mcolors.SymLogNorm(linthresh=linthresh, vmin=-vlim, vmax=+vlim) if vlim is not None \
-                    else mcolors.SymLogNorm(linthresh=linthresh)
-            if scale == "log_abs":
-                return mcolors.LogNorm()
-            raise ValueError("scale must be 'linear', 'symlog', or 'log_abs'.")
-    
-        # what to plot
-        if charge_scale == "log_abs":
-            rho_plot = np.abs(rho_xt_n) + 1e-300
-            norm_rho = mcolors.LogNorm()
-            cmap_rho = "viridis"
-        else:
-            rho_plot = rho_xt_n
-            norm_rho = make_norm(charge_scale, vlim_charge, symlog_linthresh_charge)
-            cmap_rho = cmap_charge
-    
-        if field_scale == "log_abs":
-            Ex_plot = np.abs(Ex_xt) + 1e-300
-            norm_Ex = mcolors.LogNorm()
-            cmap_Ex = "viridis"
-        else:
-            Ex_plot = Ex_xt
-            norm_Ex = make_norm(field_scale, vlim_field, symlog_linthresh_field)
-            cmap_Ex = cmap_field
-    
-        # extent: [xmin, xmax, tmin, tmax] because X is x_nm, Y is time
-        extent = [x_nm_used[0], x_nm_used[-1], t.min(), t.max()]
-    
-        fig, (ax0, ax1) = plt.subplots(1, 2, figsize=(14, 5), sharey=True)
-    
-        im0 = ax0.imshow(
-            rho_plot,
-            origin="lower",
-            aspect="auto",
-            extent=extent,
-            cmap=cmap_rho,
-            norm=norm_rho,
-            interpolation=interpolation,
-        )
-        ax0.set_title(f"(a) net charge density / ion scale\n(z={z0}, y≈{y0_nm_used:.1f} nm)")
-        ax0.set_xlabel("x (nm)")
-        ax0.set_ylabel("time (fs) (0 fs = laser peak)")
-        cb0 = fig.colorbar(im0, ax=ax0)
-        cb0.set_label(r"$\rho_\mathrm{net}$ / ion scale")
-    
-        im1 = ax1.imshow(
-            Ex_plot,
-            origin="lower",
-            aspect="auto",
-            extent=extent,
-            cmap=cmap_Ex,
-            norm=norm_Ex,
-            interpolation=interpolation,
-        )
-        ax1.set_title("(b) $E_x/E_0$" if field_norm == "E0" else "(b) $E_x$ (SI)")
-        ax1.set_xlabel("x (nm)")
-        cb1 = fig.colorbar(im1, ax=ax1)
-        cb1.set_label(r"$E_x/E_0$" if field_norm == "E0" else r"$E_x$ (SI)")
-    
-        plt.tight_layout()
-        if savepath is not None:
-            fig.savefig(savepath, dpi=200)
-        if show:
-            plt.show()
-        plt.close(fig)
-    
-        meta = dict(z_index=z0, y_index=y0, y_nm_used=y0_nm_used, x_range_nm=x_range_nm)
-        return t, x_nm_used, rho_xt_n, Ex_xt, meta
-
-
-    def plot_energy_partition_vs_time(
-        self,
-        electron_species="He_e",
-        ion_species="He_i",
-        show_laser=False,
-        tau_fwhm_fs=40,
-        I0_Wcm2=4e14,
-        lambda_um=0.8,
-    ):
-        import scipy.constants as sc
-    
-        self._load_meta()
-    
-        t_list = []
-        Ee_list = []
-        Ei_list = []
-    
-        me = self._mass_kg(electron_species)
-        mi = self._mass_kg(ion_species)
-    
-        for fn in self.files:
-            step = extract_step_from_filename(fn)
-            t_fs = self.time_fs_from_step(step)
-    
-            # electrons
-            px, py, pz, we = self._read_momentum_and_weight(fn, step, electron_species)
-            Ee = 0
-            if px is not None:
-                Ee = np.sum(we * (px**2 + py**2 + pz**2) / (2*me))
-    
-            # ions
-            px, py, pz, wi = self._read_momentum_and_weight(fn, step, ion_species)
-            Ei = 0
-            if px is not None:
-                Ei = np.sum(wi * (px**2 + py**2 + pz**2) / (2*mi))
-    
-            t_list.append(t_fs)
-            Ee_list.append(Ee / sc.e)  # to eV
-            Ei_list.append(Ei / sc.e)
-    
-        t = np.array(t_list)
-        Ee = np.array(Ee_list)
-        Ei = np.array(Ei_list)
-        Etot = Ee + Ei
-    
-        order = np.argsort(t)
-        t, Ee, Ei, Etot = t[order], Ee[order], Ei[order], Etot[order]
-    
-        fig, ax = plt.subplots(figsize=(10,4))
-    
-        ax.plot(t, Ee, label="electrons")
-        ax.plot(t, Ei, label="ions")
-        ax.plot(t, Etot, label="total", linestyle="--")
-    
-        ax.set_xlabel("time (fs)")
-        ax.set_ylabel("kinetic energy (eV)")
-        ax.legend()
-        ax.grid(True)
-    
-        if show_laser:
-            I_t = I0_Wcm2 * np.exp(-4*np.log(2)*(t/tau_fwhm_fs)**2)
-            Up_t = 9.33e-14 * I_t * lambda_um**2
-            ax2 = ax.twinx()
-            ax2.plot(t, Up_t, color="gray", alpha=0.4)
-            ax2.set_ylabel("Up (eV)")
-    
-        plt.tight_layout()
-        plt.show()
-
-
-    def plot_core_electron_density_vs_time(
-        self,
-        *,
-        electron_density_field: str = "He_e_all_density",
-        mode: str = "max_slice_y",      # "max_slice_y" (fast) or "max3d" (best, heavier)
-        y_nm: float = 300.0,            # used for max_slice_y
-        assume_charge_density: bool = True,  # if the field is charge density (C/m^3), convert to number density
-        lambda_um: float = 0.8,
-    ):
-        """
-        Plot core electron density vs time, normalized to critical density ncrit.
-    
-        'core density' here is taken as:
-          - mode="max_slice_y": max of density in an x–z slice at fixed y (fast; matches your page-1 slices)
-          - mode="max3d":       global max over full 3D field (more correct but can be heavier)
-    
-        If assume_charge_density=True, converts rho (C/m^3) -> ne (1/m^3) via ne = |rho|/e.
-        """
-        import numpy as np
-        import matplotlib.pyplot as plt
-        import scipy.constants as sc
-    
-        self._load_meta()
-    
-        # ncrit for given wavelength
-        lam = float(lambda_um) * 1e-6
-        omega = 2.0 * np.pi * sc.c / lam
-        ncrit = sc.epsilon_0 * sc.m_e * omega**2 / (sc.e**2)  # 1/m^3
-    
-        t_list = []
-        ne_core_list = []
-    
-        for fn in self.files:
-            step = extract_step_from_filename(fn)
-            t_fs = self.time_fs_from_step(step)
-    
-            with adios2.Stream(fn, "r") as f:
-                for _ in f.steps():
-                    base = f"/data/{step}/fields/{electron_density_field}"
-                    if base not in f.available_variables():
-                        ne_core = np.nan
-                        break
-    
-                    unit = 1.0
-                    try:
-                        unit = f.read_attribute(f"{base}/unitSI")
-                    except Exception:
-                        pass
-    
-                    if mode == "max3d":
-                        rho = f.read(base) * unit  # full 3D array
-                        rho = np.asarray(rho)
-                        ne_core = np.nanmax(np.abs(rho))
-                    elif mode == "max_slice_y":
-                        y_idx = int((float(y_nm) * 1e-9) / self.Dy_SI)
-                        y_idx = max(0, min(self.Ny - 1, y_idx))
-                        rho = f.read(base, start=[0, y_idx, 0], count=[self.Nz, 1, self.Nx]) * unit
-                        rho = np.asarray(rho)[:, 0, :]
-                        ne_core = np.nanmax(np.abs(rho))
-                    else:
-                        raise ValueError("mode must be 'max_slice_y' or 'max3d'")
-    
-            # convert to number density if needed
-            if assume_charge_density:
-                ne_core = ne_core / sc.e  # (C/m^3)/e -> 1/m^3
-    
-            t_list.append(t_fs)
-            ne_core_list.append(ne_core)
-    
-        t = np.array(t_list, dtype=float)
-        ne_core = np.array(ne_core_list, dtype=float)
-        order = np.argsort(t)
-        t, ne_core = t[order], ne_core[order]
-    
-        ratio = ne_core / ncrit
-    
-        plt.figure(figsize=(9, 4))
-        plt.plot(t, ratio, "o-", ms=4)
-        plt.axhline(1.0, lw=1.2, linestyle="--")
-        plt.xlabel("time - t_peak (fs)")
-        plt.ylabel(r"$n_e^\mathrm{core}/n_\mathrm{crit}$")
-        plt.title(f"Core electron density vs time (field='{electron_density_field}', mode={mode})")
-        plt.grid(True)
-        plt.tight_layout()
-        plt.show()
-        plt.close()
-    
-        return t, ne_core, ncrit
-
-
-
-
-
-
-
-
-
-
-
-        
